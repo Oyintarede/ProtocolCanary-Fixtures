@@ -4,7 +4,9 @@ Run with: python3 -m unittest discover tests
 """
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
 import sys
 import tempfile
 import unittest
@@ -175,6 +177,18 @@ method = "get-network"
         report = self.run_validation({"a.toml": bad})
         self.assertTrue(any("at least one" in e for e in report.errors))
 
+    def test_rejects_unrecognized_rpc_assert_kind(self) -> None:
+        bad = VALID_RPC.replace('kind = "field-equals"', 'kind = "field-contains"')
+        report = self.run_validation({"a.toml": bad})
+        errors = [e for e in report.errors if "assert[0].kind" in e]
+        self.assertEqual(len(errors), 1, report.errors)
+        # The error must name the offending kind and enumerate the kinds the
+        # validator does accept, so that neither widening nor narrowing
+        # RPC_ASSERT_KINDS can pass unnoticed.
+        self.assertIn("field-contains", errors[0])
+        for supported in ("field-exists", "field-type", "field-equals"):
+            self.assertIn(supported, errors[0])
+
     def test_soroban_fixture_requires_expect(self) -> None:
         bad = VALID_SOROBAN.replace("[expect]\nkind = \"simulation-success\"\n", "")
         report = self.run_validation({"a.toml": bad})
@@ -205,6 +219,53 @@ method = "get-network"
         )
         report = self.run_validation({"a.toml": good})
         self.assertEqual(report.errors, [])
+
+
+class QuietFlagTests(unittest.TestCase):
+    """`--quiet` suppresses warnings while keeping errors and the summary."""
+
+    def run_main(self, argv: list[str]) -> tuple[int, str, str]:
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = validate.main(argv)
+        return code, out.getvalue(), err.getvalue()
+
+    def write_warning_fixture(self, root: Path) -> None:
+        # Valid fixture that omits source_reference -> warning only.
+        write(root, "warn.toml", VALID_XDR.replace('source_reference = "CAP-0083"\n', ""))
+
+    def write_error_fixture(self, root: Path) -> None:
+        # Invalid surface -> error only (source_reference is still present).
+        write(root, "error.toml", VALID_XDR.replace('surface = "xdr"', 'surface = "wallet"'))
+
+    def test_default_prints_warnings(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.write_warning_fixture(root)
+            self.write_error_fixture(root)
+            code, out, err = self.run_main([str(root)])
+        self.assertIn("warning:", out)
+        self.assertIn("error:", err)
+        self.assertEqual(code, 1)
+
+    def test_quiet_suppresses_warnings_but_keeps_errors(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.write_warning_fixture(root)
+            self.write_error_fixture(root)
+            code, out, err = self.run_main(["--quiet", str(root)])
+        self.assertNotIn("warning:", out)
+        self.assertIn("error:", err)
+        self.assertEqual(code, 1)
+
+    def test_quiet_keeps_ok_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.write_warning_fixture(root)
+            code, out, err = self.run_main(["--quiet", str(root)])
+        self.assertNotIn("warning:", out)
+        self.assertIn("OK:", out)
+        self.assertEqual(code, 0)
 
 
 if __name__ == "__main__":
